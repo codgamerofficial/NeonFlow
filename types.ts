@@ -24,3 +24,11 @@ export interface AudioVisualizerData {
   analyser: AnalyserNode | null;
   dataArray: Uint8Array | null;
 }
+
+export interface Playlist {
+  id: string;
+  name: string;
+  tracks: Track[];
+}
+
+export type VisualizerMode = 'orb' | 'bars' | 'wave';
