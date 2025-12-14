@@ -179,7 +179,7 @@ const App: React.FC = () => {
 
   // --- Track Change Logic ---
   useEffect(() => {
-    if (!currentTrack) return;
+    if (!currentTrack || currentTrack.status === 'uploading') return;
     const audio = audioRef.current;
     
     // Only update source if it's different
@@ -300,18 +300,47 @@ const App: React.FC = () => {
     const files = e.target.files;
     if (files && files[0]) {
       const file = files[0];
-      const url = URL.createObjectURL(file);
-      const newTrack: Track = {
-        id: Date.now().toString(),
+      const tempId = `uploading-${Date.now()}`;
+      
+      // 1. Add placeholder track to state for immediate UI feedback
+      const placeholderTrack: Track = {
+        id: tempId,
         title: file.name.replace(/\.[^/.]+$/, ""),
         artist: 'Local Upload',
-        url: url
+        url: '', // No URL yet, not playable
+        status: 'uploading',
       };
-      setTracks(prev => [...prev, newTrack]);
-      if (playbackContext === 'library') {
-         setCurrentTrackIndex(tracks.length);
-         setIsPlaying(true);
-      }
+      setTracks(prev => [...prev, placeholderTrack]);
+
+      // 2. Process file in the background. A timeout ensures the placeholder renders first.
+      setTimeout(() => {
+        const url = URL.createObjectURL(file);
+        
+        const finalTrack: Track = {
+          id: Date.now().toString(), // Use a new permanent ID
+          title: placeholderTrack.title,
+          artist: placeholderTrack.artist,
+          url: url,
+          status: 'ready',
+        };
+
+        // 3. Replace placeholder with the final, playable track and auto-play
+        setTracks(prevTracks => {
+          const finalTracks = [...prevTracks];
+          const placeholderIndex = finalTracks.findIndex(t => t.id === tempId);
+          
+          if (placeholderIndex !== -1) {
+            finalTracks[placeholderIndex] = finalTrack;
+            
+            // 4. If in library context, auto-play the new track
+            if (playbackContext === 'library') {
+              setCurrentTrackIndex(placeholderIndex);
+              setIsPlaying(true);
+            }
+          }
+          return finalTracks;
+        });
+      }, 100);
     }
   };
 
@@ -571,22 +600,30 @@ const App: React.FC = () => {
                             {tracks.map((track, idx) => (
                               <div 
                                 key={track.id}
-                                className={`group relative p-3 rounded-xl flex items-center gap-3 cursor-pointer transition-all hover:bg-white/10 ${playbackContext === 'library' && currentTrackIndex === idx ? 'bg-white/20' : ''}`}
+                                className={`group relative p-3 rounded-xl flex items-center gap-3 transition-all ${track.status === 'uploading' ? 'opacity-50' : 'cursor-pointer hover:bg-white/10'} ${playbackContext === 'library' && currentTrackIndex === idx ? 'bg-white/20' : ''}`}
                               >
-                                  <div className="w-10 h-10 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={() => handleTrackSelect(track, idx, 'library')}>
-                                    {track.coverUrl ? <img src={track.coverUrl} className="w-full h-full object-cover" /> : <Music size={16} />}
+                                  <div className="w-10 h-10 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
+                                    {track.status === 'uploading' ? (
+                                      <div className="w-5 h-5 border-2 border-gray-500 border-t-white rounded-full animate-spin"></div>
+                                    ) : track.coverUrl ? (
+                                      <img src={track.coverUrl} className="w-full h-full object-cover" />
+                                    ) : (
+                                      <Music size={16} />
+                                    )}
                                   </div>
-                                  <div className="overflow-hidden flex-1" onClick={() => handleTrackSelect(track, idx, 'library')}>
+                                  <div className="overflow-hidden flex-1" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
                                     <div className={`text-sm font-medium truncate ${playbackContext === 'library' && currentTrackIndex === idx ? 'text-white' : 'text-gray-300'}`}>{track.title}</div>
                                     <div className="text-xs text-gray-500 truncate">{track.artist}</div>
                                   </div>
-                                  <button 
-                                    onClick={(e) => { e.stopPropagation(); setTrackToAdd(track); }}
-                                    className="p-1.5 rounded-full hover:bg-white/20 text-gray-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
-                                    title="Add to Playlist"
-                                  >
-                                    <Plus size={16} />
-                                  </button>
+                                  {track.status !== 'uploading' && (
+                                    <button 
+                                      onClick={(e) => { e.stopPropagation(); setTrackToAdd(track); }}
+                                      className="p-1.5 rounded-full hover:bg-white/20 text-gray-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                                      title="Add to Playlist"
+                                    >
+                                      <Plus size={16} />
+                                    </button>
+                                  )}
                               </div>
                             ))}
                         </div>

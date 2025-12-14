@@ -4,6 +4,7 @@ export interface Track {
   artist: string;
   url: string; // URL to audio file
   coverUrl?: string;
+  status?: 'uploading' | 'ready';
 }
 
 export interface PlaybackState {
