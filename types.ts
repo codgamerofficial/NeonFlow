@@ -2,9 +2,11 @@ export interface Track {
   id: string;
   title: string;
   artist: string;
-  url: string; // URL to audio file
+  url: string; // URL to audio file (or empty if youtubeId is present)
+  youtubeId?: string; // YouTube Video ID
   coverUrl?: string;
   status?: 'uploading' | 'ready';
+  isLocal?: boolean;
 }
 
 export interface PlaybackState {

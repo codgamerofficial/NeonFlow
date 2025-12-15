@@ -1,14 +1,17 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls } from '@react-three/drei';
-import { Disc3, Music, ListMusic, Plus, Upload, Trash2, Eye, FolderPlus, MoreVertical, X, MessageSquare, Mic2, Sliders, Save, Search as SearchIcon } from 'lucide-react';
+import { Disc3, Music, ListMusic, Plus, Upload, Trash2, Eye, FolderPlus, MoreVertical, X, MessageSquare, Mic2, Sliders, Save, Search as SearchIcon, Globe, Library } from 'lucide-react';
 import Visualizer3D from './components/Visualizer3D';
 import PlayerControls from './components/PlayerControls';
 import AIChat from './components/AIChat';
 import LyricsPanel from './components/LyricsPanel';
+import YouTubeAudioPlayer from './components/YouTubeAudioPlayer';
 import { Track, ChatMessage, Playlist, VisualizerMode } from './types';
 import { DEMO_TRACKS, INITIAL_DJ_MESSAGE } from './constants';
 import { generateDJResponse, analyzeTrackVibe, fetchLyrics } from './services/gemini';
+import { initDB, getAllTracks, saveTrack, deleteTrackFromDB } from './services/db';
+import { searchYouTube } from './services/youtube';
 
 interface VisualizerPreset {
   id: string;
@@ -19,20 +22,77 @@ interface VisualizerPreset {
   speed: number;
 }
 
+// Helper for fuzzy search scoring
+const getRelevanceScore = (text: string, query: string): number => {
+  const t = text.toLowerCase().trim();
+  const q = query.toLowerCase().trim();
+  
+  if (!t || !q) return 0;
+  
+  // Exact match
+  if (t === q) return 100;
+  
+  // Starts with
+  if (t.startsWith(q)) return 80;
+  
+  // Contains
+  if (t.includes(q)) return 60;
+  
+  // Word matching
+  const queryWords = q.split(/\s+/).filter(w => w.length > 0);
+  if (queryWords.length === 0) return 0;
+  
+  const textWords = t.split(/\s+/);
+  let matchedWords = 0;
+  
+  for (const qw of queryWords) {
+    if (textWords.some(tw => tw.startsWith(qw))) {
+      matchedWords += 1;
+    } else if (textWords.some(tw => tw.includes(qw))) {
+      matchedWords += 0.5;
+    }
+  }
+  
+  if (matchedWords >= queryWords.length) return 40;
+  if (matchedWords > 0) return 10 + (matchedWords / queryWords.length) * 20;
+
+  // Simple Subsequence (Fuzzy)
+  // e.g. "nd" matches "Neon Dreams"
+  let qIdx = 0;
+  let tIdx = 0;
+  while (tIdx < t.length && qIdx < q.length) {
+      if (t[tIdx] === q[qIdx]) {
+          qIdx++;
+      }
+      tIdx++;
+  }
+  
+  if (qIdx === q.length) return 5; // Low score for subsequence
+
+  return 0;
+};
+
 const App: React.FC = () => {
   // --- Audio State ---
   const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS); // "Library"
+  const [tracksLoaded, setTracksLoaded] = useState(false);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [currentView, setCurrentView] = useState<'library' | 'playlist'>('library');
   const [activePlaylistId, setActivePlaylistId] = useState<string | null>(null); // For viewing
   
   // What is actually playing context
-  const [playbackContext, setPlaybackContext] = useState<'library' | string>('library'); // 'library' or playlist ID
+  const [playbackContext, setPlaybackContext] = useState<'library' | string | 'youtube'>('library'); // 'library', playlist ID, or 'youtube'
   const [currentTrackIndex, setCurrentTrackIndex] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [volume, setVolume] = useState(0.7);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  
+  // Youtube specific state
+  const [searchMode, setSearchMode] = useState<'library' | 'youtube'>('library');
+  const [youtubeResults, setYoutubeResults] = useState<Track[]>([]);
+  const [isSearchingYoutube, setIsSearchingYoutube] = useState(false);
+  const [youtubeSeekTo, setYoutubeSeekTo] = useState<number|null>(null);
 
   // --- Search State ---
   const [searchQuery, setSearchQuery] = useState('');
@@ -75,11 +135,48 @@ const App: React.FC = () => {
   const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
 
   // Derived: The list of tracks currently playing
-  const playingTracks = playbackContext === 'library' 
-    ? tracks 
-    : playlists.find(p => p.id === playbackContext)?.tracks || tracks;
+  let playingTracks: Track[] = tracks;
+  if (playbackContext === 'library') playingTracks = tracks;
+  else if (playbackContext === 'youtube') playingTracks = youtubeResults.length > 0 ? youtubeResults : [currentTrackIndex < youtubeResults.length ? youtubeResults[currentTrackIndex] : DEMO_TRACKS[0]]; // Fallback safety
+  else {
+     const pl = playlists.find(p => p.id === playbackContext);
+     playingTracks = pl ? pl.tracks : tracks;
+  }
+  
+  // Safety check for empty lists
+  if (playingTracks.length === 0 && playbackContext === 'youtube' && youtubeResults.length > 0) playingTracks = youtubeResults;
     
   const currentTrack = playingTracks[currentTrackIndex] || tracks[0];
+  const isYoutubeTrack = !!currentTrack?.youtubeId;
+
+  // --- Load local tracks on startup ---
+  useEffect(() => {
+    const loadPersistedTracks = async () => {
+      if (tracksLoaded) return;
+      await initDB();
+      const localTracks = await getAllTracks();
+      setTracks(prev => [...prev, ...localTracks]);
+      setTracksLoaded(true);
+    };
+    loadPersistedTracks();
+  }, [tracksLoaded]);
+
+  // --- YouTube Search Effect ---
+  useEffect(() => {
+    const performYoutubeSearch = async () => {
+      if (searchMode === 'youtube' && searchQuery.length > 2) {
+         setIsSearchingYoutube(true);
+         const results = await searchYouTube(searchQuery);
+         setYoutubeResults(results);
+         setIsSearchingYoutube(false);
+      }
+    };
+    
+    // Debounce search
+    const timer = setTimeout(performYoutubeSearch, 500);
+    return () => clearTimeout(timer);
+  }, [searchQuery, searchMode]);
+
 
   // --- Helper Functions ---
   const fetchLyricsForCurrentTrack = async (track: Track) => {
@@ -182,21 +279,29 @@ const App: React.FC = () => {
     if (!currentTrack || currentTrack.status === 'uploading') return;
     const audio = audioRef.current;
     
-    // Only update source if it's different
-    if (decodeURIComponent(audio.src) !== decodeURIComponent(currentTrack.url)) {
-       audio.src = currentTrack.url;
-       if (isPlaying) {
-         audio.play().catch(e => console.error("Play failed:", e));
-       }
-       // Analyze new track vibe
-       analyzeTrackVibe(currentTrack).then((vibe) => {
-          setVisualColor(vibe.color);
-       });
-
-       // Fetch Lyrics using the new helper function (handles cache)
-       fetchLyricsForCurrentTrack(currentTrack);
+    if (isYoutubeTrack) {
+        // Pause HTML5 audio if we are switching to Youtube
+        audio.pause();
+    } else {
+        // Standard Audio Playback
+        // Only update source if it's different and valid
+        if (currentTrack.url && decodeURIComponent(audio.src) !== decodeURIComponent(currentTrack.url)) {
+           audio.src = currentTrack.url;
+           if (isPlaying) {
+             audio.play().catch(e => console.error("Play failed:", e));
+           }
+        }
     }
-  }, [currentTrack, isPlaying]);
+    
+    // Analyze new track vibe
+    analyzeTrackVibe(currentTrack).then((vibe) => {
+      setVisualColor(vibe.color);
+    });
+
+    // Fetch Lyrics using the new helper function (handles cache)
+    fetchLyricsForCurrentTrack(currentTrack);
+
+  }, [currentTrack, isPlaying, isYoutubeTrack]);
 
   useEffect(() => {
     audioRef.current.volume = volume;
@@ -204,27 +309,36 @@ const App: React.FC = () => {
 
   // --- Controls ---
   const handlePlayPause = () => {
-    const audio = audioRef.current;
-    if (isPlaying) audio.pause();
-    else audio.play().catch(e => console.error(e));
+    if (!isYoutubeTrack) {
+        const audio = audioRef.current;
+        if (isPlaying) audio.pause();
+        else audio.play().catch(e => console.error(e));
+    }
     setIsPlaying(!isPlaying);
   };
 
   const handleNext = () => {
-    setCurrentTrackIndex((prev) => (prev + 1) % playingTracks.length);
+    const list = playingTracks;
+    setCurrentTrackIndex((prev) => (prev + 1) % list.length);
   };
 
   const handlePrev = () => {
-    setCurrentTrackIndex((prev) => (prev - 1 + playingTracks.length) % playingTracks.length);
+    const list = playingTracks;
+    setCurrentTrackIndex((prev) => (prev - 1 + list.length) % list.length);
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = Number(e.target.value);
-    audioRef.current.currentTime = time;
     setCurrentTime(time);
+    
+    if (isYoutubeTrack) {
+        setYoutubeSeekTo(time);
+    } else {
+        audioRef.current.currentTime = time;
+    }
   };
 
-  const handleTrackSelect = (track: Track, index: number, context: 'library' | string = 'library') => {
+  const handleTrackSelect = (track: Track, index: number, context: 'library' | 'youtube' | string) => {
     if (context !== playbackContext) {
       setPlaybackContext(context);
     }
@@ -295,44 +409,50 @@ const App: React.FC = () => {
     }));
   };
 
-  // --- File Upload ---
+  // --- File Upload & Deletion ---
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files && files[0]) {
       const file = files[0];
       const tempId = `uploading-${Date.now()}`;
       
-      // 1. Add placeholder track to state for immediate UI feedback
       const placeholderTrack: Track = {
         id: tempId,
         title: file.name.replace(/\.[^/.]+$/, ""),
         artist: 'Local Upload',
-        url: '', // No URL yet, not playable
+        url: '',
         status: 'uploading',
+        isLocal: true,
       };
       setTracks(prev => [...prev, placeholderTrack]);
 
-      // 2. Process file in the background. A timeout ensures the placeholder renders first.
-      setTimeout(() => {
+      setTimeout(async () => {
         const url = URL.createObjectURL(file);
+        const permanentId = Date.now().toString();
         
         const finalTrack: Track = {
-          id: Date.now().toString(), // Use a new permanent ID
+          id: permanentId,
           title: placeholderTrack.title,
           artist: placeholderTrack.artist,
           url: url,
           status: 'ready',
+          isLocal: true,
         };
 
-        // 3. Replace placeholder with the final, playable track and auto-play
+        // Save to IndexedDB
+        await saveTrack({ 
+          id: finalTrack.id, 
+          title: finalTrack.title, 
+          artist: finalTrack.artist, 
+          isLocal: true 
+        }, file);
+
         setTracks(prevTracks => {
           const finalTracks = [...prevTracks];
           const placeholderIndex = finalTracks.findIndex(t => t.id === tempId);
           
           if (placeholderIndex !== -1) {
             finalTracks[placeholderIndex] = finalTrack;
-            
-            // 4. If in library context, auto-play the new track
             if (playbackContext === 'library') {
               setCurrentTrackIndex(placeholderIndex);
               setIsPlaying(true);
@@ -344,20 +464,53 @@ const App: React.FC = () => {
     }
   };
 
+  const handleDeleteTrack = async (trackIdToDelete: string) => {
+    if (window.confirm("Permanently delete this track from your library?")) {
+      // If it's the currently playing track, stop playback
+      if (currentTrack?.id === trackIdToDelete) {
+        setIsPlaying(false);
+        audioRef.current.src = '';
+        setCurrentTime(0);
+      }
+      
+      // Remove from DB
+      await deleteTrackFromDB(trackIdToDelete);
+      
+      // Remove from state
+      setTracks(prev => prev.filter(t => t.id !== trackIdToDelete));
+    }
+  };
+
   const switchVisualizer = () => {
      const modes: VisualizerMode[] = ['orb', 'bars', 'wave'];
      const currentIdx = modes.indexOf(visualizerMode);
      setVisualizerMode(modes[(currentIdx + 1) % modes.length]);
   };
 
-  // --- Search Logic ---
-  const filteredTracks = searchQuery 
-    ? tracks.filter(t => t.title.toLowerCase().includes(searchQuery.toLowerCase()) || t.artist.toLowerCase().includes(searchQuery.toLowerCase()))
-    : tracks;
+  // --- Search Logic with Fuzzy Matching & Relevance Sorting ---
+  const filteredTracks = useMemo(() => {
+    if (!searchQuery) return tracks;
+    
+    return tracks
+      .map(track => {
+        const titleScore = getRelevanceScore(track.title, searchQuery);
+        const artistScore = getRelevanceScore(track.artist, searchQuery);
+        return { track, score: Math.max(titleScore, artistScore) };
+      })
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(item => item.track);
+  }, [searchQuery, tracks]);
 
-  const filteredPlaylists = searchQuery
-    ? playlists.filter(p => p.name.toLowerCase().includes(searchQuery.toLowerCase()))
-    : playlists;
+  const filteredPlaylists = useMemo(() => {
+    if (!searchQuery) return playlists;
+
+    return playlists
+      .map(playlist => ({ playlist, score: getRelevanceScore(playlist.name, searchQuery) }))
+      .filter(item => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(item => item.playlist);
+  }, [searchQuery, playlists]);
 
   return (
     <div className="relative w-full h-full bg-black overflow-hidden font-sans text-white">
@@ -371,6 +524,7 @@ const App: React.FC = () => {
             mode={visualizerMode}
             intensity={visualSettings.intensity}
             speed={visualSettings.speed}
+            isSimulated={isYoutubeTrack && isPlaying} // Simulate visualizer if YouTube
             onSwitchMode={switchVisualizer}
             onChangeColor={setVisualColor}
             onChangeIntensity={(val) => setVisualSettings(prev => ({ ...prev, intensity: val }))}
@@ -379,6 +533,20 @@ const App: React.FC = () => {
           <OrbitControls enableZoom={false} autoRotate autoRotateSpeed={0.5 * visualSettings.speed} />
         </Canvas>
       </div>
+      
+      {/* Hidden YouTube Player */}
+      <YouTubeAudioPlayer 
+         videoId={isYoutubeTrack ? currentTrack.youtubeId! : ''}
+         isPlaying={isYoutubeTrack && isPlaying}
+         volume={volume}
+         seekTo={youtubeSeekTo}
+         onProgress={(curr, dur) => {
+             setCurrentTime(curr);
+             setDuration(dur);
+             setYoutubeSeekTo(null); // Reset seek trigger
+         }}
+         onEnded={handleNext}
+      />
 
       {/* Main Overlay */}
       <div className="absolute inset-0 z-10 flex flex-col pointer-events-none">
@@ -511,13 +679,29 @@ const App: React.FC = () => {
            <div className={`absolute inset-0 z-50 bg-black/90 md:bg-transparent md:static md:col-span-4 lg:col-span-3 transition-all duration-300 ${showSidebar ? 'translate-x-0' : '-translate-x-full md:translate-x-0'} pointer-events-auto`}>
               <div className="h-full bg-black/40 backdrop-blur-xl border border-white/10 rounded-3xl overflow-hidden flex flex-col shadow-2xl">
                  
-                 {/* Search Bar */}
-                 <div className="p-4 border-b border-white/10">
+                 {/* Sidebar Header: Mode Switch & Search */}
+                 <div className="p-4 border-b border-white/10 flex flex-col gap-3">
+                    {/* Library / Online Toggle */}
+                    <div className="flex bg-white/5 rounded-lg p-1">
+                        <button 
+                            onClick={() => { setSearchMode('library'); setSearchQuery(''); }}
+                            className={`flex-1 flex items-center justify-center gap-2 py-1.5 text-xs font-bold rounded-md transition-all ${searchMode === 'library' ? 'bg-cyan-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
+                        >
+                            <Library size={14} /> Library
+                        </button>
+                        <button 
+                            onClick={() => { setSearchMode('youtube'); setSearchQuery(''); }}
+                            className={`flex-1 flex items-center justify-center gap-2 py-1.5 text-xs font-bold rounded-md transition-all ${searchMode === 'youtube' ? 'bg-red-600 text-white shadow-lg' : 'text-gray-400 hover:text-white'}`}
+                        >
+                            <Globe size={14} /> Online
+                        </button>
+                    </div>
+
                     <div className="relative">
                       <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} />
                       <input 
                         type="text" 
-                        placeholder="Search tracks or playlists..." 
+                        placeholder={searchMode === 'youtube' ? "Search YouTube..." : "Search library..."}
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         className="w-full bg-white/5 border border-white/10 rounded-xl py-2 pl-10 pr-4 text-sm text-white focus:outline-none focus:border-cyan-500 transition-colors placeholder-gray-500"
@@ -530,158 +714,191 @@ const App: React.FC = () => {
                     </div>
                  </div>
 
-                 {/* Sidebar Content: Search Results OR Standard Tabs */}
-                 {searchQuery ? (
-                    <div className="flex-1 overflow-y-auto p-2 space-y-4">
-                        {/* Tracks Result */}
-                        <div>
-                          <h4 className="px-2 mb-2 text-xs font-bold text-gray-500 uppercase tracking-wider">Tracks Found</h4>
-                          {filteredTracks.length === 0 && <p className="px-2 text-sm text-gray-600 italic">No tracks found.</p>}
-                          {filteredTracks.map((track) => {
-                             const originalIndex = tracks.findIndex(t => t.id === track.id);
-                             return (
-                               <div 
-                                 key={track.id}
-                                 className="group relative p-2 rounded-lg flex items-center gap-3 cursor-pointer hover:bg-white/10"
-                               >
-                                  <div className="w-8 h-8 rounded bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={() => handleTrackSelect(track, originalIndex, 'library')}>
-                                     {track.coverUrl ? <img src={track.coverUrl} className="w-full h-full object-cover" /> : <Music size={14} />}
-                                  </div>
-                                  <div className="overflow-hidden flex-1" onClick={() => handleTrackSelect(track, originalIndex, 'library')}>
-                                     <div className="text-sm font-medium text-gray-200 truncate">{track.title}</div>
-                                     <div className="text-xs text-gray-500 truncate">{track.artist}</div>
-                                  </div>
-                               </div>
-                             );
-                          })}
-                        </div>
-                        
-                        {/* Playlists Result */}
-                        <div>
-                           <h4 className="px-2 mb-2 text-xs font-bold text-gray-500 uppercase tracking-wider">Playlists Found</h4>
-                           {filteredPlaylists.length === 0 && <p className="px-2 text-sm text-gray-600 italic">No playlists found.</p>}
-                           {filteredPlaylists.map(playlist => (
-                              <div 
-                                key={playlist.id}
-                                onClick={() => {
-                                  setActivePlaylistId(playlist.id);
-                                  setCurrentView('playlist');
-                                  setSearchQuery('');
-                                }}
-                                className="p-3 rounded-lg flex items-center justify-between cursor-pointer hover:bg-white/10"
-                              >
-                                 <span className="text-sm font-medium truncate">{playlist.name}</span>
-                                 <span className="text-xs text-gray-500">{playlist.tracks.length} songs</span>
-                              </div>
-                           ))}
-                        </div>
-                    </div>
-                 ) : (
-                    <>
-                      {/* Sidebar Navigation */}
-                      <div className="p-2 flex gap-1 border-b border-white/10">
-                          <button 
-                            onClick={() => setCurrentView('library')}
-                            className={`flex-1 py-2 text-sm font-bold uppercase tracking-wider rounded-lg transition-colors ${currentView === 'library' ? 'bg-white/20 text-white' : 'text-gray-500 hover:text-white hover:bg-white/5'}`}
-                          >
-                            Library
-                          </button>
-                          <button 
-                            onClick={() => setCurrentView('playlist')}
-                            className={`flex-1 py-2 text-sm font-bold uppercase tracking-wider rounded-lg transition-colors ${currentView === 'playlist' ? 'bg-white/20 text-white' : 'text-gray-500 hover:text-white hover:bg-white/5'}`}
-                          >
-                            Playlists
-                          </button>
-                      </div>
-
-                      {/* Library View */}
-                      {currentView === 'library' && (
-                        <div className="flex-1 overflow-y-auto p-2 space-y-1">
-                            {tracks.map((track, idx) => (
-                              <div 
-                                key={track.id}
-                                className={`group relative p-3 rounded-xl flex items-center gap-3 transition-all ${track.status === 'uploading' ? 'opacity-50' : 'cursor-pointer hover:bg-white/10'} ${playbackContext === 'library' && currentTrackIndex === idx ? 'bg-white/20' : ''}`}
-                              >
-                                  <div className="w-10 h-10 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
-                                    {track.status === 'uploading' ? (
-                                      <div className="w-5 h-5 border-2 border-gray-500 border-t-white rounded-full animate-spin"></div>
-                                    ) : track.coverUrl ? (
-                                      <img src={track.coverUrl} className="w-full h-full object-cover" />
-                                    ) : (
-                                      <Music size={16} />
-                                    )}
-                                  </div>
-                                  <div className="overflow-hidden flex-1" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
-                                    <div className={`text-sm font-medium truncate ${playbackContext === 'library' && currentTrackIndex === idx ? 'text-white' : 'text-gray-300'}`}>{track.title}</div>
-                                    <div className="text-xs text-gray-500 truncate">{track.artist}</div>
-                                  </div>
-                                  {track.status !== 'uploading' && (
-                                    <button 
-                                      onClick={(e) => { e.stopPropagation(); setTrackToAdd(track); }}
-                                      className="p-1.5 rounded-full hover:bg-white/20 text-gray-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
-                                      title="Add to Playlist"
-                                    >
-                                      <Plus size={16} />
-                                    </button>
-                                  )}
-                              </div>
-                            ))}
-                        </div>
-                      )}
-
-                      {/* Playlists View */}
-                      {currentView === 'playlist' && (
-                        <div className="flex-1 flex flex-col h-full">
-                          {/* List of Playlists (Top half if viewing specific, or full if not) */}
-                          <div className={`overflow-y-auto p-2 space-y-1 border-b border-white/10 ${activePlaylistId ? 'h-1/3' : 'flex-1'}`}>
-                              <button onClick={createPlaylist} className="w-full py-3 mb-2 flex items-center justify-center gap-2 border border-dashed border-gray-600 rounded-xl text-gray-400 hover:text-white hover:border-white transition-all text-sm">
-                                <FolderPlus size={16} /> New Playlist
-                              </button>
-                              {playlists.map(playlist => (
-                                <div 
-                                  key={playlist.id}
-                                  onClick={() => setActivePlaylistId(playlist.id)}
-                                  className={`p-3 rounded-xl flex items-center justify-between cursor-pointer transition-all hover:bg-white/10 ${activePlaylistId === playlist.id ? 'bg-white/20 border border-white/10' : ''}`}
-                                >
-                                    <span className="text-sm font-medium truncate">{playlist.name}</span>
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-xs text-gray-500">{playlist.tracks.length} songs</span>
-                                      <button onClick={(e) => deletePlaylist(playlist.id, e)} className="text-gray-500 hover:text-red-400"><Trash2 size={14}/></button>
-                                    </div>
-                                </div>
-                              ))}
-                          </div>
-                          
-                          {/* Tracks in Selected Playlist */}
-                          {activePlaylistId && (
-                            <div className="flex-1 overflow-y-auto p-2 bg-black/20">
-                                <div className="px-2 py-1 text-xs text-gray-500 uppercase font-bold tracking-wider mb-2">
-                                  {playlists.find(p => p.id === activePlaylistId)?.name} Tracks
-                                </div>
-                                {playlists.find(p => p.id === activePlaylistId)?.tracks.length === 0 && (
-                                  <div className="text-center text-gray-600 text-xs py-4">No tracks yet. Add from Library.</div>
-                                )}
-                                {playlists.find(p => p.id === activePlaylistId)?.tracks.map((track, idx) => (
-                                  <div 
-                                      key={`${track.id}-${idx}`}
-                                      className={`group p-2 rounded-lg flex items-center gap-2 cursor-pointer hover:bg-white/5 ${playbackContext === activePlaylistId && currentTrackIndex === idx ? 'bg-white/10' : ''}`}
-                                  >
-                                      <div className="flex-1 overflow-hidden" onClick={() => handleTrackSelect(track, idx, activePlaylistId)}>
-                                        <div className="text-sm text-gray-300 truncate">{track.title}</div>
-                                        <div className="text-xs text-gray-600">{track.artist}</div>
-                                      </div>
-                                      <button 
-                                        onClick={(e) => removeFromPlaylist(activePlaylistId, track.id, e)}
-                                        className="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100"
-                                      >
-                                        <X size={14} />
-                                      </button>
-                                  </div>
-                                ))}
+                 {/* Sidebar Content */}
+                 {searchMode === 'youtube' ? (
+                     // --- YOUTUBE RESULTS ---
+                     <div className="flex-1 overflow-y-auto p-2 space-y-2">
+                        {isSearchingYoutube && (
+                            <div className="flex items-center justify-center py-8">
+                                <div className="w-6 h-6 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
                             </div>
-                          )}
-                        </div>
-                      )}
+                        )}
+                        {!isSearchingYoutube && youtubeResults.length === 0 && searchQuery.length > 2 && (
+                             <p className="text-center text-gray-500 text-xs mt-4">No results found.</p>
+                        )}
+                        {!isSearchingYoutube && youtubeResults.length === 0 && searchQuery.length <= 2 && (
+                             <div className="text-center text-gray-600 text-xs mt-8 px-4">
+                                <Globe size={24} className="mx-auto mb-2 opacity-50"/>
+                                Type to search millions of songs on YouTube.
+                             </div>
+                        )}
+                        {youtubeResults.map((track, idx) => (
+                           <div 
+                              key={track.id}
+                              className={`group p-2 rounded-lg flex items-center gap-3 cursor-pointer hover:bg-white/10 ${playbackContext === 'youtube' && currentTrackIndex === idx ? 'bg-white/10 border border-white/5' : ''}`}
+                              onClick={() => handleTrackSelect(track, idx, 'youtube')}
+                           >
+                              <div className="relative w-10 h-10 rounded-md bg-gray-800 overflow-hidden shrink-0">
+                                 {track.coverUrl ? <img src={track.coverUrl} className="w-full h-full object-cover" /> : <Music size={16}/>}
+                                 <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity">
+                                    <div className="w-6 h-6 rounded-full bg-red-600 flex items-center justify-center">
+                                       <div className="w-0 h-0 border-t-[4px] border-t-transparent border-l-[6px] border-l-white border-b-[4px] border-b-transparent ml-0.5"></div>
+                                    </div>
+                                 </div>
+                              </div>
+                              <div className="overflow-hidden flex-1">
+                                 <div className={`text-sm font-medium truncate ${playbackContext === 'youtube' && currentTrackIndex === idx ? 'text-white' : 'text-gray-300'}`}>{track.title}</div>
+                                 <div className="text-xs text-gray-500 truncate">{track.artist}</div>
+                              </div>
+                           </div>
+                        ))}
+                     </div>
+                 ) : (
+                     // --- LIBRARY / PLAYLISTS ---
+                    <>
+                         {/* Search Results (Library) */}
+                         {searchQuery && (
+                            <div className="flex-1 overflow-y-auto p-2 space-y-4">
+                                <div>
+                                <h4 className="px-2 mb-2 text-xs font-bold text-gray-500 uppercase tracking-wider">Tracks Found</h4>
+                                {filteredTracks.map((track) => {
+                                    const originalIndex = tracks.findIndex(t => t.id === track.id);
+                                    return (
+                                    <div 
+                                        key={track.id}
+                                        className="group relative p-2 rounded-lg flex items-center gap-3 cursor-pointer hover:bg-white/10"
+                                    >
+                                        <div className="w-8 h-8 rounded bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={() => handleTrackSelect(track, originalIndex, 'library')}>
+                                            {track.coverUrl ? <img src={track.coverUrl} className="w-full h-full object-cover" /> : <Music size={14} />}
+                                        </div>
+                                        <div className="overflow-hidden flex-1" onClick={() => handleTrackSelect(track, originalIndex, 'library')}>
+                                            <div className="text-sm font-medium text-gray-200 truncate">{track.title}</div>
+                                            <div className="text-xs text-gray-500 truncate">{track.artist}</div>
+                                        </div>
+                                    </div>
+                                    );
+                                })}
+                                </div>
+                            </div>
+                         )}
+
+                         {/* Standard Tabs (if not searching) */}
+                         {!searchQuery && (
+                            <>
+                                <div className="p-2 flex gap-1 border-b border-white/10">
+                                    <button 
+                                        onClick={() => setCurrentView('library')}
+                                        className={`flex-1 py-2 text-sm font-bold uppercase tracking-wider rounded-lg transition-colors ${currentView === 'library' ? 'bg-white/20 text-white' : 'text-gray-500 hover:text-white hover:bg-white/5'}`}
+                                    >
+                                        Library
+                                    </button>
+                                    <button 
+                                        onClick={() => setCurrentView('playlist')}
+                                        className={`flex-1 py-2 text-sm font-bold uppercase tracking-wider rounded-lg transition-colors ${currentView === 'playlist' ? 'bg-white/20 text-white' : 'text-gray-500 hover:text-white hover:bg-white/5'}`}
+                                    >
+                                        Playlists
+                                    </button>
+                                </div>
+
+                                {/* Library View */}
+                                {currentView === 'library' && (
+                                    <div className="flex-1 overflow-y-auto p-2 space-y-1">
+                                        {tracks.map((track, idx) => (
+                                        <div 
+                                            key={track.id}
+                                            className={`group relative p-3 rounded-xl flex items-center gap-3 transition-all ${track.status === 'uploading' ? 'opacity-50' : 'cursor-pointer hover:bg-white/10'} ${playbackContext === 'library' && currentTrackIndex === idx ? 'bg-white/20' : ''}`}
+                                        >
+                                            <div className="w-10 h-10 rounded-lg bg-gray-800 flex items-center justify-center overflow-hidden shrink-0" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
+                                                {track.status === 'uploading' ? (
+                                                <div className="w-5 h-5 border-2 border-gray-500 border-t-white rounded-full animate-spin"></div>
+                                                ) : track.coverUrl ? (
+                                                <img src={track.coverUrl} className="w-full h-full object-cover" />
+                                                ) : (
+                                                <Music size={16} />
+                                                )}
+                                            </div>
+                                            <div className="overflow-hidden flex-1" onClick={track.status !== 'uploading' ? () => handleTrackSelect(track, idx, 'library') : undefined}>
+                                                <div className={`text-sm font-medium truncate ${playbackContext === 'library' && currentTrackIndex === idx ? 'text-white' : 'text-gray-300'}`}>{track.title}</div>
+                                                <div className="text-xs text-gray-500 truncate">{track.artist}</div>
+                                            </div>
+                                            
+                                            {track.isLocal && track.status !== 'uploading' && (
+                                                <button 
+                                                onClick={(e) => { e.stopPropagation(); handleDeleteTrack(track.id); }}
+                                                className="p-1.5 rounded-full hover:bg-red-500/20 text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                                title="Delete Track"
+                                                >
+                                                <Trash2 size={14} />
+                                                </button>
+                                            )}
+                                            
+                                            {track.status !== 'uploading' && (
+                                                <button 
+                                                onClick={(e) => { e.stopPropagation(); setTrackToAdd(track); }}
+                                                className="p-1.5 rounded-full hover:bg-white/20 text-gray-400 hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                                                title="Add to Playlist"
+                                                >
+                                                <Plus size={16} />
+                                                </button>
+                                            )}
+                                        </div>
+                                        ))}
+                                    </div>
+                                )}
+
+                                {/* Playlists View */}
+                                {currentView === 'playlist' && (
+                                    <div className="flex-1 flex flex-col h-full">
+                                    <div className={`overflow-y-auto p-2 space-y-1 border-b border-white/10 ${activePlaylistId ? 'h-1/3' : 'flex-1'}`}>
+                                        <button onClick={createPlaylist} className="w-full py-3 mb-2 flex items-center justify-center gap-2 border border-dashed border-gray-600 rounded-xl text-gray-400 hover:text-white hover:border-white transition-all text-sm">
+                                            <FolderPlus size={16} /> New Playlist
+                                        </button>
+                                        {playlists.map(playlist => (
+                                            <div 
+                                            key={playlist.id}
+                                            onClick={() => setActivePlaylistId(playlist.id)}
+                                            className={`p-3 rounded-xl flex items-center justify-between cursor-pointer transition-all hover:bg-white/10 ${activePlaylistId === playlist.id ? 'bg-white/20 border border-white/10' : ''}`}
+                                            >
+                                                <span className="text-sm font-medium truncate">{playlist.name}</span>
+                                                <div className="flex items-center gap-2">
+                                                <span className="text-xs text-gray-500">{playlist.tracks.length} songs</span>
+                                                <button onClick={(e) => deletePlaylist(playlist.id, e)} className="text-gray-500 hover:text-red-400"><Trash2 size={14}/></button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    
+                                    {activePlaylistId && (
+                                        <div className="flex-1 overflow-y-auto p-2 bg-black/20">
+                                            <div className="px-2 py-1 text-xs text-gray-500 uppercase font-bold tracking-wider mb-2">
+                                            {playlists.find(p => p.id === activePlaylistId)?.name} Tracks
+                                            </div>
+                                            {playlists.find(p => p.id === activePlaylistId)?.tracks.length === 0 && (
+                                            <div className="text-center text-gray-600 text-xs py-4">No tracks yet. Add from Library.</div>
+                                            )}
+                                            {playlists.find(p => p.id === activePlaylistId)?.tracks.map((track, idx) => (
+                                            <div 
+                                                key={`${track.id}-${idx}`}
+                                                className={`group p-2 rounded-lg flex items-center gap-2 cursor-pointer hover:bg-white/5 ${playbackContext === activePlaylistId && currentTrackIndex === idx ? 'bg-white/10' : ''}`}
+                                            >
+                                                <div className="flex-1 overflow-hidden" onClick={() => handleTrackSelect(track, idx, activePlaylistId)}>
+                                                    <div className="text-sm text-gray-300 truncate">{track.title}</div>
+                                                    <div className="text-xs text-gray-600">{track.artist}</div>
+                                                </div>
+                                                <button 
+                                                    onClick={(e) => removeFromPlaylist(activePlaylistId, track.id, e)}
+                                                    className="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100"
+                                                >
+                                                    <X size={14} />
+                                                </button>
+                                            </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                    </div>
+                                )}
+                            </>
+                         )}
                     </>
                  )}
                  
@@ -748,6 +965,7 @@ const App: React.FC = () => {
              trackTitle={currentTrack?.title}
              trackArtist={currentTrack?.artist}
              coverUrl={currentTrack?.coverUrl}
+             lyrics={lyrics}
           />
         </footer>
 

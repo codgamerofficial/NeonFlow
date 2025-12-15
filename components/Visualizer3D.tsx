@@ -10,6 +10,7 @@ interface Visualizer3DProps {
   mode: VisualizerMode;
   intensity: number;
   speed: number;
+  isSimulated?: boolean; // New prop for YouTube simulation
   onSwitchMode: () => void;
   onChangeColor: (color: string) => void;
   onChangeIntensity: (val: number) => void;
@@ -21,26 +22,108 @@ interface VisualizerModeProps {
   color: string;
   intensity: number;
   speed: number;
+  isSimulated?: boolean;
+  onChangeIntensity: (val: number) => void;
+  onChangeSpeed: (val: number) => void;
 }
 
+// Custom hook for drag logic to be reused by visualizers
+const useVisualizerDrag = (
+  intensity: number, 
+  speed: number, 
+  onChangeIntensity: (v: number) => void, 
+  onChangeSpeed: (v: number) => void
+) => {
+  const dragState = useRef({
+    isDragging: false,
+    startPos: { x: 0, y: 0 },
+    startIntensity: 0,
+    startSpeed: 0,
+  });
+
+  const onPointerDown = (e: any) => {
+    e.stopPropagation();
+    dragState.current = {
+      isDragging: true,
+      startPos: { x: e.clientX, y: e.clientY },
+      startIntensity: intensity,
+      startSpeed: speed,
+    };
+    e.target.setPointerCapture(e.pointerId);
+    document.body.style.cursor = 'grabbing';
+  };
+
+  const onPointerMove = (e: any) => {
+    if (!dragState.current.isDragging) return;
+    e.stopPropagation();
+    
+    const deltaX = e.clientX - dragState.current.startPos.x;
+    const deltaY = e.clientY - dragState.current.startPos.y;
+
+    // Sensitivity factor: 150px drag = 1.0 change in value
+    const speedChange = deltaX / 150;
+    const intensityChange = -deltaY / 150; // Invert Y-axis
+
+    const newSpeed = Math.max(0, Math.min(4.0, dragState.current.startSpeed + speedChange));
+    const newIntensity = Math.max(0.1, Math.min(3.0, dragState.current.startIntensity + intensityChange));
+
+    onChangeSpeed(newSpeed);
+    onChangeIntensity(newIntensity);
+  };
+
+  const onPointerUp = (e: any) => {
+    if (!dragState.current.isDragging) return;
+    e.stopPropagation();
+    dragState.current.isDragging = false;
+    e.target.releasePointerCapture(e.pointerId);
+    document.body.style.cursor = 'grab';
+  };
+
+  return {
+    onPointerDown,
+    onPointerMove,
+    onPointerUp,
+    onPointerOut: onPointerUp, // End drag if pointer leaves
+    onPointerOver: () => { document.body.style.cursor = 'grab'; },
+    onPointerLeave: () => { document.body.style.cursor = 'auto'; }
+  };
+};
+
+// --- SIMULATION HELPER ---
+// Generates fake frequency data based on time if simulation is active
+const getFrequencyData = (audioData: AudioVisualizerData, isSimulated: boolean, time: number) => {
+  const { analyser, dataArray } = audioData;
+  
+  if (!isSimulated && analyser && dataArray) {
+    analyser.getByteFrequencyData(dataArray);
+    // Return average freq
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+    return { dataArray, average: sum / dataArray.length };
+  }
+  
+  // Simulation Mode
+  if (isSimulated) {
+     const simulatedAvg = (Math.sin(time * 4) * 0.5 + 0.5) * 128 + 64; // Beat pulse
+     return { dataArray: null, average: simulatedAvg };
+  }
+
+  return { dataArray: null, average: 0 };
+};
+
+
 // 1. ORB VISUALIZER
-const OrbVisualizer = ({ audioData, color, intensity, speed }: VisualizerModeProps) => {
+const OrbVisualizer = ({ audioData, color, intensity, speed, isSimulated, onChangeIntensity, onChangeSpeed }: VisualizerModeProps) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const materialRef = useRef<any>(null);
+  const dragHandlers = useVisualizerDrag(intensity, speed, onChangeIntensity, onChangeSpeed);
 
-  useFrame(() => {
-    const { analyser, dataArray } = audioData;
-    let averageFreq = 0;
-    if (analyser && dataArray) {
-      analyser.getByteFrequencyData(dataArray);
-      let sum = 0;
-      for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-      averageFreq = sum / dataArray.length;
-    }
+  useFrame((state) => {
+    const { average } = getFrequencyData(audioData, !!isSimulated, state.clock.elapsedTime);
 
     if (meshRef.current && materialRef.current) {
       // Intensity affects scale amplitude
-      const scale = 1 + (averageFreq / 255) * (1.5 * intensity);
+      const scale = 1 + (average / 255) * (1.5 * intensity);
       meshRef.current.scale.lerp(new THREE.Vector3(scale, scale, scale), 0.1);
       
       // Speed affects rotation
@@ -48,39 +131,46 @@ const OrbVisualizer = ({ audioData, color, intensity, speed }: VisualizerModePro
       meshRef.current.rotation.y += 0.002 * speed;
       
       // Intensity affects distortion amount
-      materialRef.current.distort = (0.3 * intensity) + (averageFreq / 255) * (0.6 * intensity);
+      materialRef.current.distort = (0.3 * intensity) + (average / 255) * (0.6 * intensity);
       
       // Speed affects texture movement speed
-      materialRef.current.speed = (1 * speed) + (averageFreq / 255) * 4;
+      materialRef.current.speed = (1 * speed) + (average / 255) * 4;
       
       materialRef.current.color.lerp(new THREE.Color(color), 0.05);
     }
   });
 
   return (
-    <Sphere args={[1, 64, 64]} ref={meshRef}>
+    <Sphere args={[1, 64, 64]} ref={meshRef} {...dragHandlers}>
       <MeshDistortMaterial ref={materialRef} color={color} envMapIntensity={0.4} clearcoat={1} clearcoatRoughness={0.1} metalness={0.5} />
     </Sphere>
   );
 };
 
 // 2. BARS VISUALIZER (Circular Spectrum)
-const BarsVisualizer = ({ audioData, color, intensity, speed }: VisualizerModeProps) => {
+const BarsVisualizer = ({ audioData, color, intensity, speed, isSimulated, onChangeIntensity, onChangeSpeed }: VisualizerModeProps) => {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const count = 64; // Number of bars
   const dummy = useMemo(() => new THREE.Object3D(), []);
   const radius = 2.5;
+  const dragHandlers = useVisualizerDrag(intensity, speed, onChangeIntensity, onChangeSpeed);
 
-  useFrame(() => {
-    const { analyser, dataArray } = audioData;
-    if (analyser && dataArray && meshRef.current) {
-      analyser.getByteFrequencyData(dataArray);
+  useFrame((state) => {
+    const { dataArray, average } = getFrequencyData(audioData, !!isSimulated, state.clock.elapsedTime);
+
+    if (meshRef.current) {
       
       for (let i = 0; i < count; i++) {
-        // Map bar index to frequency bin
-        const freqIndex = Math.floor((i / count) * (dataArray.length / 2)); 
-        const value = dataArray[freqIndex] / 255;
+        let value = 0;
         
+        if (dataArray) {
+             const freqIndex = Math.floor((i / count) * (dataArray.length / 2)); 
+             value = dataArray[freqIndex] / 255;
+        } else if (isSimulated) {
+             // Fake frequency spread based on index and time
+             value = (Math.sin(state.clock.elapsedTime * 10 + i * 0.5) * 0.5 + 0.5) * (average / 255);
+        }
+
         const angle = (i / count) * Math.PI * 2;
         const x = Math.cos(angle) * radius;
         const z = Math.sin(angle) * radius;
@@ -104,27 +194,31 @@ const BarsVisualizer = ({ audioData, color, intensity, speed }: VisualizerModePr
   });
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, count]}>
-      <boxGeometry args={[0.1, 1, 0.1]} />
-      <meshStandardMaterial color={color} toneMapped={false} emissive={color} emissiveIntensity={2} />
-    </instancedMesh>
+    <group>
+      {/* Invisible sphere to act as a unified drag target for all bars */}
+      <Sphere args={[radius + 0.5, 32, 32]} visible={false} {...dragHandlers} />
+      <instancedMesh ref={meshRef} args={[undefined, undefined, count]}>
+        <boxGeometry args={[0.1, 1, 0.1]} />
+        <meshStandardMaterial color={color} toneMapped={false} emissive={color} emissiveIntensity={2} />
+      </instancedMesh>
+    </group>
   );
 };
 
 // 3. WAVE VISUALIZER (Wireframe Terrain)
-const WaveVisualizer = ({ audioData, color, intensity, speed }: VisualizerModeProps) => {
+const WaveVisualizer = ({ audioData, color, intensity, speed, isSimulated, onChangeIntensity, onChangeSpeed }: VisualizerModeProps) => {
   const meshRef = useRef<THREE.Mesh>(null);
   const timeRef = useRef(0);
+  const dragHandlers = useVisualizerDrag(intensity, speed, onChangeIntensity, onChangeSpeed);
   
   useFrame((state, delta) => {
-    const { analyser, dataArray } = audioData;
+    const { dataArray } = getFrequencyData(audioData, !!isSimulated, state.clock.elapsedTime);
     
     // Accumulate time based on speed to prevent jumps when changing speed
     timeRef.current += delta * speed;
     const time = timeRef.current;
 
-    if (analyser && dataArray && meshRef.current) {
-      analyser.getByteFrequencyData(dataArray);
+    if (meshRef.current) {
       
       const geometry = meshRef.current.geometry;
       const positionAttribute = geometry.attributes.position;
@@ -133,9 +227,14 @@ const WaveVisualizer = ({ audioData, color, intensity, speed }: VisualizerModePr
          const x = positionAttribute.getX(i);
          const y = positionAttribute.getY(i);
          
-         // Map x/y to frequency
-         const freqIdx = Math.abs(Math.floor(x * 5) % dataArray.length);
-         const freqVal = dataArray[freqIdx] / 255;
+         let freqVal = 0;
+         if (dataArray) {
+             const freqIdx = Math.abs(Math.floor(x * 5) % dataArray.length);
+             freqVal = dataArray[freqIdx] / 255;
+         } else if (isSimulated) {
+             // Fake frequency val
+             freqVal = (Math.sin(x * 5 + time) * Math.cos(y * 5 + time) * 0.5 + 0.5) * 0.5;
+         }
          
          // Intensity scales the Z height
          // Use a mix of time and frequency data
@@ -150,7 +249,7 @@ const WaveVisualizer = ({ audioData, color, intensity, speed }: VisualizerModePr
   });
 
   return (
-    <Plane args={[10, 10, 32, 32]} rotation={[-Math.PI / 2.5, 0, 0]} ref={meshRef}>
+    <Plane args={[10, 10, 32, 32]} rotation={[-Math.PI / 2.5, 0, 0]} ref={meshRef} {...dragHandlers}>
       <meshBasicMaterial color={color} wireframe transparent opacity={0.5} />
     </Plane>
   );
@@ -415,6 +514,7 @@ const Visualizer3D: React.FC<Visualizer3DProps> = ({
   mode, 
   intensity, 
   speed, 
+  isSimulated,
   onSwitchMode, 
   onChangeColor,
   onChangeIntensity,
@@ -429,9 +529,9 @@ const Visualizer3D: React.FC<Visualizer3DProps> = ({
       <Stars radius={100} depth={50} count={5000} factor={4} saturation={0} fade speed={1} />
 
       {/* Main Visualizer */}
-      {mode === 'orb' && <OrbVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} />}
-      {mode === 'bars' && <BarsVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} />}
-      {mode === 'wave' && <WaveVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} />}
+      {mode === 'orb' && <OrbVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} isSimulated={isSimulated} onChangeIntensity={onChangeIntensity} onChangeSpeed={onChangeSpeed} />}
+      {mode === 'bars' && <BarsVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} isSimulated={isSimulated} onChangeIntensity={onChangeIntensity} onChangeSpeed={onChangeSpeed} />}
+      {mode === 'wave' && <WaveVisualizer audioData={audioData} color={primaryColor} intensity={intensity} speed={speed} isSimulated={isSimulated} onChangeIntensity={onChangeIntensity} onChangeSpeed={onChangeSpeed} />}
       
       {/* Interactive 3D Controls */}
       <InteractiveControls 

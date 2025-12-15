@@ -79,21 +79,26 @@ export const analyzeTrackVibe = async (track: Track): Promise<{ color: string, d
       description: json.description || "A mystery track from the void."
     };
   } catch (error) {
+    // Fallback behavior for any error
+    const colors = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"];
+    const fallbackColor = colors[(track.title.length + track.artist.length) % colors.length];
+    
     if (isQuotaError(error)) {
       console.warn("Gemini Quota Exceeded (Vibe Analysis)");
-      // Fallback to a pseudo-random color based on the title length to keep the UI dynamic
-      const colors = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899"];
-      const fallbackColor = colors[(track.title.length + track.artist.length) % colors.length];
-      return { 
-        color: fallbackColor, 
-        description: "Vibe analysis offline (Quota Limit)." 
-      };
+    } else {
+      console.warn("Gemini Vibe Analysis Error (using fallback):", error);
     }
-    return { color: "#6366f1", description: "Unknown frequency detected." };
+    
+    return { 
+      color: fallbackColor, 
+      description: "Unknown frequency detected." 
+    };
   }
 };
 
-export const fetchLyrics = async (track: Track): Promise<string> => {
+const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+export const fetchLyrics = async (track: Track, retryCount = 0): Promise<string> => {
   try {
     const ai = getClient();
     const prompt = `Fetch the lyrics for the song "${track.title}" by "${track.artist}".
@@ -106,11 +111,19 @@ export const fetchLyrics = async (track: Track): Promise<string> => {
     });
 
     return response.text || "";
-  } catch (error) {
+  } catch (error: any) {
+    // Simple retry logic for 500 errors or network hiccups
+    if (retryCount < 1 && (error?.status === 500 || error?.message?.includes('Rpc failed'))) {
+      console.log("Retrying lyrics fetch due to transient error...");
+      await wait(1000);
+      return fetchLyrics(track, retryCount + 1);
+    }
+
     if (isQuotaError(error)) {
       console.warn("Gemini Quota Exceeded (Lyrics)");
       return "Lyrics unavailable: API Quota Limit Exceeded.\n\nPlease try again later or manually add lyrics.";
     }
+    
     console.error("Lyrics Fetch Error:", error);
     return ""; // Return empty to trigger manual input or empty state
   }
